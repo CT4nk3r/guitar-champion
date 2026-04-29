@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Guitar Champion — Infinite Highway</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: "Impact", "Arial Black", sans-serif;
+    color: #fff;
+  }
+  canvas {
+    display: block;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("stage");
+  const ctx = canvas.getContext("2d");
+
+  let W = 0, H = 0, DPR = 1;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ----- Constants -----
+  const LANES = 5;
+  const LANE_COLORS = [
+    { name: "green",  hex: "#3aff5e", glow: "#7dff9a" },
+    { name: "red",    hex: "#ff3b3b", glow: "#ff8585" },
+    { name: "yellow", hex: "#ffe23a", glow: "#fff39a" },
+    { name: "blue",   hex: "#3aaaff", glow: "#88d1ff" },
+    { name: "orange", hex: "#ff9a2a", glow: "#ffc680" },
+  ];
+
+  // Highway perspective geometry, recomputed on resize and each frame
+  function geometry() {
+    const vanishY = H * 0.22;
+    const strumY  = H * 0.86;
+    const topHalfWidth    = Math.min(W, H) * 0.05;
+    const bottomHalfWidth = Math.min(W * 0.55, H * 0.95);
+    const cx = W * 0.5;
+    return { vanishY, strumY, topHalfWidth, bottomHalfWidth, cx };
+  }
+
+  // Project: progress p in [0,1] (0 = far/vanishing, 1 = near/strum)
+  // Uses a non-linear curve to mimic real perspective acceleration
+  function projY(p, g) {
+    const e = p * p; // ease-in toward viewer
+    return g.vanishY + (g.strumY - g.vanishY) * e;
+  }
+  function projHalfWidth(p, g) {
+    const e = p * p;
+    return g.topHalfWidth + (g.bottomHalfWidth - g.topHalfWidth) * e;
+  }
+  function laneCenterX(lane, p, g) {
+    const hw = projHalfWidth(p, g);
+    const t = (lane + 0.5) / LANES; // 0..1
+    return g.cx - hw + t * 2 * hw;
+  }
+  function laneWidth(p, g) {
+    return (projHalfWidth(p, g) * 2) / LANES;
+  }
+  function projScale(p) {
+    // 1 at near (p=1), small at far (p=0)
+    return 0.18 + 0.82 * (p * p);
+  }
+
+  // ----- Crowd -----
+  const crowd = [];
+  function buildCrowd() {
+    crowd.length = 0;
+    const count = Math.floor(W / 9) + 40;
+    for (let i = 0; i < count; i++) {
+      crowd.push({
+        x: Math.random() * W,
+        baseY: H * (0.86 + Math.random() * 0.12),
+        h: 28 + Math.random() * 38,
+        w: 14 + Math.random() * 10,
+        phase: Math.random() * Math.PI * 2,
+        speed: 0.6 + Math.random() * 1.2,
+        armPhase: Math.random() * Math.PI * 2,
+        depth: Math.random(), // 0 close, 1 far back
+      });
+    }
+  }
+  buildCrowd();
+  window.addEventListener("resize", buildCrowd);
+
+  // ----- Spotlights -----
+  const spotlights = [];
+  for (let i = 0; i < 5; i++) {
+    spotlights.push({
+      baseX: 0.15 + i * 0.175, // fraction of W
+      angle: 0,
+      angleSpeed: (Math.random() - 0.5) * 0.6,
+      hue: Math.random() * 360,
+      hueShift: 12 + Math.random() * 30,
+      intensity: 0.5 + Math.random() * 0.4,
+    });
+  }
+
+  // ----- Notes -----
+  // Each note: lane, p (progress 0 far -> 1 near), speed (per second in p units),
+  // hold (bool), holdLen (in p units), tail visual progress
+  const notes = [];
+
+  // Rhythmic pattern generator
+  let nextSpawnIn = 0;     // seconds until next spawn event
+  let patternState = {
+    mode: "burst",         // "burst", "chord", "pause", "run", "hold"
+    remaining: 0,
+    interval: 0.35,
+    baseLane: 0,
+    runDir: 1,
+  };
+  let densityWindow = []; // timestamps of recent spawns for density calc
+
+  function pickPattern() {
+    const r = Math.random();
+    if (r < 0.18) {
+      patternState.mode = "chord";
+      patternState.remaining = 1;
+      patternState.interval = 0.05;
+    } else if (r < 0.32) {
+      patternState.mode = "pause";
+      patternState.remaining = 1;
+      patternState.interval = 0.5 + Math.random() * 0.7;
+    } else if (r < 0.5) {
+      patternState.mode = "run";
+      patternState.remaining = 5 + Math.floor(Math.random() * 5);
+      patternState.interval = 0.11 + Math.random() * 0.07;
+      patternState.baseLane = Math.floor(Math.random() * LANES);
+      patternState.runDir = Math.random() < 0.5 ? 1 : -1;
+    } else if (r < 0.62) {
+      patternState.mode = "hold";
+      patternState.remaining = 1;
+      patternState.interval = 0.4;
+    } else {
+      patternState.mode = "burst";
+      patternState.remaining = 3 + Math.floor(Math.random() * 6);
+      patternState.interval = 0.15 + Math.random() * 0.18;
+    }
+  }
+  pickPattern();
+
+  function spawnNote(lane, opts = {}) {
+    notes.push({
+      lane,
+      p: 0,
+      speed: 0.32 + Math.random() * 0.05, // p per second
+      hold: !!opts.hold,
+      holdLen: opts.hold ? (0.18 + Math.random() * 0.22) : 0,
+      tailFromP: 0, // updated when hold tail starts visible
+      hit: false,
+      chord: !!opts.chord,
+    });
+    densityWindow.push(performance.now());
+  }
+
+  function updateSpawning(dt) {
+    nextSpawnIn -= dt;
+    if (nextSpawnIn > 0) return;
+
+    if (patternState.mode === "pause") {
+      // Long silence
+      patternState.remaining = 0;
+      nextSpawnIn = patternState.interval;
+      pickPattern();
+      return;
+    }
+
+    if (patternState.mode === "chord") {
+      // 2-4 simultaneous lanes
+      const count = 2 + Math.floor(Math.random() * 3);
+      const lanes = new Set();
+      while (lanes.size < count) lanes.add(Math.floor(Math.random() * LANES));
+      lanes.forEach(l => spawnNote(l, { chord: true }));
+      patternState.remaining = 0;
+      nextSpawnIn = 0.25 + Math.random() * 0.25;
+      pickPattern();
+      return;
+    }
+
+    if (patternState.mode === "hold") {
+      const lane = Math.floor(Math.random() * LANES);
+      spawnNote(lane, { hold: true });
+      patternState.remaining = 0;
+      nextSpawnIn = 0.4 + Math.random() * 0.4;
+      pickPattern();
+      return;
+    }
+
+    if (patternState.mode === "run") {
+      const lane = ((patternState.baseLane) % LANES + LANES) % LANES;
+      spawnNote(lane);
+      patternState.baseLane += patternState.runDir;
+      if (patternState.baseLane < 0 || patternState.baseLane >= LANES) {
+        patternState.runDir *= -1;
+        patternState.baseLane += patternState.runDir * 2;
+      }
+      patternState.remaining--;
+      nextSpawnIn = patternState.interval;
+      if (patternState.remaining <= 0) pickPattern();
+      return;
+    }
+
+    // burst (default)
+    const lane = Math.floor(Math.random() * LANES);
+    // occasional double-stop
+    if (Math.random() < 0.12) {
+      let l2 = (lane + 1 + Math.floor(Math.random() * (LANES - 1))) % LANES;
+      spawnNote(lane, { chord: true });
+      spawnNote(l2,   { chord: true });
+    } else {
+      spawnNote(lane);
+    }
+    patternState.remaining--;
+    nextSpawnIn = patternState.interval * (0.85 + Math.random() * 0.4);
+    if (patternState.remaining <= 0) pickPattern();
+  }
+
+  // ----- Effects -----
+  const particles = [];   // hit burst particles
+  const shards = [];      // light shards (rect particles)
+  const shockwaves = [];  // expanding rings
+  const flashes = [];     // fret button flashes
+  const laneTrails = [];  // hold note color trails on a lane
+
+  function spawnHitFX(lane, isChord) {
+    const g = geometry();
+    const p = 1.0;
+    const x = laneCenterX(lane, p, g);
+    const y = g.strumY;
+    const color = LANE_COLORS[lane];
+    const baseCount = isChord ? 55 : 30;
+
+    flashes.push({ lane, age: 0, life: 0.45, isChord });
+    shockwaves.push({ x, y, r: 10, maxR: isChord ? 220 : 130, age: 0, life: 0.55, color: color.hex });
+
+    if (isChord) {
+      shockwaves.push({ x: g.cx, y, r: 20, maxR: g.bottomHalfWidth * 1.2, age: 0, life: 0.7, color: "#ffffff" });
+    }
+
+    for (let i = 0; i < baseCount; i++) {
+      const ang = -Math.PI / 2 + (Math.random() - 0.5) * Math.PI * 1.4;
+      const spd = 120 + Math.random() * 380;
+      particles.push({
+        x, y,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd + 60, // bias downward fall
+        life: 0.6 + Math.random() * 0.6,
+        age: 0,
+        size: 1.5 + Math.random() * 2.5,
+        color: Math.random() < 0.3 ? "#ffffff" : color.hex,
+        glow: color.glow,
+      });
+    }
+    for (let i = 0; i < (isChord ? 18 : 10); i++) {
+      const ang = -Math.PI / 2 + (Math.random() - 0.5) * Math.PI * 1.6;
+      const spd = 200 + Math.random() * 500;
+      shards.push({
+        x, y,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd + 80,
+        rot: Math.random() * Math.PI * 2,
+        vrot: (Math.random() - 0.5) * 8,
+        len: 14 + Math.random() * 26,
+        thick: 2 + Math.random() * 2,
+        life: 0.55 + Math.random() * 0.5,
+        age: 0,
+        color: Math.random() < 0.5 ? "#ffffff" : color.hex,
+      });
+    }
+  }
+
+  function spawnHoldTrail(lane, fromP, toP) {
+    laneTrails.push({ lane, fromP, toP, age: 0, life: 0.9, color: LANE_COLORS[lane].hex });
+  }
+
+  // ----- Score / Combo / Star Power -----
+  let score = 0;
+  let combo = 0;
+  let multiplier = 1;
+  let starPower = 0;        // 0..1
+  let starPowerActive = false;
+  let starPowerTimer = 0;
+  const STAR_POWER_DURATION = 6.0;
+  let displayedScore = 0;
+
+  function onHit(isChord, holdBonus = 0) {
+    combo++;
+    multiplier = Math.min(8, 1 + Math.floor(combo / 10));
+    const base = (isChord ? 100 : 50) + holdBonus;
+    const gain = base * multiplier * (starPowerActive ? 2 : 1);
+    score += gain;
+    if (!starPowerActive) {
+      starPower = Math.min(1, starPower + (isChord ? 0.04 : 0.018));
+      if (starPower >= 1) {
+        starPowerActive = true;
+        starPowerTimer = STAR_POWER_DURATION;
+      }
+    }
+  }
+
+  // ----- Background helpers -----
+  let stageHueOffset = 0;
+
+  function drawBackground(t) {
+    // Sky gradient
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, "#0a0712");
+    sky.addColorStop(0.45, "#160a25");
+    sky.addColorStop(0.85, "#070309");
+    sky.addColorStop(1, "#000000");
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, W, H);
+
+    // Distant stage glow at vanishing area
+    const g = geometry();
+    const grad = ctx.createRadialGradient(g.cx, g.vanishY, 5, g.cx, g.vanishY, Math.max(W, H) * 0.5);
+    grad.addColorStop(0, "rgba(120, 70, 200, 0.35)");
+    grad.addColorStop(0.4, "rgba(60, 30, 110, 0.18)");
+    grad.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawSpotlights(t, density, chordFlash) {
+    const g = geometry();
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (let i = 0; i < spotlights.length; i++) {
+      const sp = spotlights[i];
+      sp.angle += sp.angleSpeed * 0.016 * (1 + density * 0.4);
+      sp.hue += sp.hueShift * 0.016 * (0.7 + density * 0.6);
+      const ox = sp.baseX * W;
+      const oy = -20;
+      const sweep = Math.sin(sp.angle * 0.7 + i) * (W * 0.25) + Math.sin(t * 0.6 + i) * 30;
+      const tx = ox + sweep;
+      const ty = H * (0.55 + Math.sin(t * 0.4 + i) * 0.05);
+
+      const len = Math.hypot(tx - ox, ty - oy);
+      const nx = (tx - ox) / len;
+      const ny = (ty - oy) / len;
+      const perpX = -ny, perpY = nx;
+      const halfWidthNear = 4;
+      const halfWidthFar  = 110 + Math.sin(t * 1.5 + i) * 30;
+      const farLen = len * 1.4;
+
+      const hue = ((sp.hue % 360) + 360) % 360;
+      const sat = 90;
+      const baseLight = 55;
+      const intensityPulse = 0.65 + 0.35 * Math.sin(t * 3 + i * 1.3);
+      const alpha = 0.16 * sp.intensity * intensityPulse * (chordFlash ? 1.4 : 1) * (starPowerActive ? 1.4 : 1);
+
+      ctx.beginPath();
+      ctx.moveTo(ox + perpX * halfWidthNear, oy + perpY * halfWidthNear);
+      ctx.lineTo(ox + nx * farLen + perpX * halfWidthFar, oy + ny * farLen + perpY * halfWidthFar);
+      ctx.lineTo(ox + nx * farLen - perpX * halfWidthFar, oy + ny * farLen - perpY * halfWidthFar);
+      ctx.lineTo(ox - perpX * halfWidthNear, oy - perpY * halfWidthNear);
+      ctx.closePath();
+
+      const beam = ctx.createLinearGradient(ox, oy, ox + nx * farLen, oy + ny * farLen);
+      const col = starPowerActive ? `hsla(50, 100%, 70%, ${alpha})` : `hsla(${hue}, ${sat}%, ${baseLight}%, ${alpha})`;
+      const colEnd = starPowerActive ? `hsla(50, 100%, 70%, 0)` : `hsla(${hue}, ${sat}%, ${baseLight}%, 0)`;
+      beam.addColorStop(0, col);
+      beam.addColorStop(1, colEnd);
+      ctx.fillStyle = beam;
+      ctx.fill();
+
+      // Source bulb
+      ctx.fillStyle = `hsla(${hue}, 100%, 75%, 0.9)`;
+      ctx.beginPath();
+      ctx.arc(ox, oy + 4, 6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawHazeAndGodRays(t) {
+    // Volumetric haze layer
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const g = geometry();
+    const haze = ctx.createLinearGradient(0, H * 0.25, 0, H * 0.95);
+    haze.addColorStop(0, "rgba(180,170,220,0.0)");
+    haze.addColorStop(0.5, "rgba(180,170,220,0.07)");
+    haze.addColorStop(1, "rgba(120,110,180,0.13)");
+    ctx.fillStyle = haze;
+    ctx.fillRect(0, H * 0.25, W, H * 0.7);
+
+    // God rays from above center
+    const rayCount = 9;
+    for (let i = 0; i < rayCount; i++) {
+      const a = (i / rayCount) * Math.PI * 2 + t * 0.05;
+      const beamX = g.cx + Math.cos(a) * 40;
+      const beamY = -10;
+      const tx = g.cx + Math.cos(a) * 600;
+      const ty = H * 0.7 + Math.sin(a) * 40;
+      const grad = ctx.createLinearGradient(beamX, beamY, tx, ty);
+      grad.addColorStop(0, "rgba(255,235,200,0.10)");
+      grad.addColorStop(1, "rgba(255,235,200,0)");
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = 30 + Math.sin(t + i) * 8;
+      ctx.beginPath();
+      ctx.moveTo(beamX, beamY);
+      ctx.lineTo(tx, ty);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawCrowd(t, density, chordExcite) {
+    ctx.save();
+    // Far back rows darker, front lighter
+    crowd.sort((a, b) => b.depth - a.depth);
+    const swaySpeed = 1.0 + density * 1.6;
+    for (const p of crowd) {
+      p.phase += 0.016 * swaySpeed * p.speed;
+      p.armPhase += 0.016 * (1.5 + density * 1.5);
+      const sway = Math.sin(p.phase) * (2 + density * 4);
+      const armRaise = chordExcite ? 1 : (0.15 + density * 0.4);
+      const armY = Math.sin(p.armPhase) * 6 - 10 * armRaise;
+
+      const shade = 8 + (1 - p.depth) * 22;
+      ctx.fillStyle = `rgb(${shade},${shade},${shade + 4})`;
+
+      // Body
+      ctx.beginPath();
+      ctx.ellipse(p.x + sway, p.baseY, p.w / 2, p.h / 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      // Head
+      ctx.beginPath();
+      ctx.arc(p.x + sway, p.baseY - p.h / 2 - 2, p.w * 0.32, 0, Math.PI * 2);
+      ctx.fill();
+      // Arms (raised when excited)
+      if (armRaise > 0.5 || Math.random() < 0.002) {
+        ctx.strokeStyle = `rgb(${shade},${shade},${shade + 4})`;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(p.x + sway - p.w * 0.4, p.baseY - p.h * 0.3);
+        ctx.lineTo(p.x + sway - p.w * 0.6, p.baseY - p.h * 0.9 + armY);
+        ctx.moveTo(p.x + sway + p.w * 0.4, p.baseY - p.h * 0.3);
+        ctx.lineTo(p.x + sway + p.w * 0.6, p.baseY - p.h * 0.9 + armY * 1.05);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawHighway(t) {
+    const g = geometry();
+    // Highway trapezoid
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(g.cx - g.topHalfWidth, g.vanishY);
+    ctx.lineTo(g.cx + g.topHalfWidth, g.vanishY);
+    ctx.lineTo(g.cx + g.bottomHalfWidth, g.strumY);
+    ctx.lineTo(g.cx - g.bottomHalfWidth, g.strumY);
+    ctx.closePath();
+
+    const hwGrad = ctx.createLinearGradient(0, g.vanishY, 0, g.strumY);
+    if (starPowerActive) {
+      hwGrad.addColorStop(0, "rgba(60,45,10,0.8)");
+      hwGrad.addColorStop(1, "rgba(120,90,20,0.95)");
+    } else {
+      hwGrad.addColorStop(0, "rgba(8,8,18,0.85)");
+      hwGrad.addColorStop(1, "rgba(15,12,28,0.95)");
+    }
+    ctx.fillStyle = hwGrad;
+    ctx.fill();
+
+    // Edge glows
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = starPowerActive ? "rgba(255,210,80,0.9)" : "rgba(180,200,255,0.55)";
+    ctx.shadowBlur = 18;
+    ctx.shadowColor = starPowerActive ? "#ffd24d" : "#88aaff";
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // Lane dividers (4 between 5 lanes)
+    for (let i = 1; i < LANES; i++) {
+      const xTop = g.cx - g.topHalfWidth + (i / LANES) * 2 * g.topHalfWidth;
+      const xBot = g.cx - g.bottomHalfWidth + (i / LANES) * 2 * g.bottomHalfWidth;
+      const lg = ctx.createLinearGradient(xTop, g.vanishY, xBot, g.strumY);
+      lg.addColorStop(0, "rgba(255,255,255,0.05)");
+      lg.addColorStop(0.6, "rgba(255,255,255,0.18)");
+      lg.addColorStop(1, "rgba(255,255,255,0.35)");
+      ctx.strokeStyle = lg;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(xTop, g.vanishY);
+      ctx.lineTo(xBot, g.strumY);
+      ctx.stroke();
+    }
+
+    // Moving "tracks" (perspective lines crossing the highway), perceived speed
+    ctx.globalCompositeOperation = "lighter";
+    const lineCount = 14;
+    for (let i = 0; i < lineCount; i++) {
+      const phase = ((i / lineCount) + (t * 0.18) % 1) % 1;
+      const p = phase;
+      const y = projY(p, g);
+      const hw = projHalfWidth(p, g);
+      const a = 0.05 + p * 0.18;
+      ctx.strokeStyle = starPowerActive ? `rgba(255,220,120,${a})` : `rgba(160,180,255,${a})`;
+      ctx.lineWidth = 0.5 + p * 1.5;
+      ctx.beginPath();
+      ctx.moveTo(g.cx - hw, y);
+      ctx.lineTo(g.cx + hw, y);
+      ctx.stroke();
+    }
+    ctx.globalCompositeOperation = "source-over";
+
+    ctx.restore();
+  }
+
+  function drawLaneTrails() {
+    const g = geometry();
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (const tr of laneTrails) {
+      const a = Math.max(0, 1 - tr.age / tr.life);
+      const steps = 14;
+      for (let s = 0; s < steps; s++) {
+        const p = tr.fromP + (tr.toP - tr.fromP) * (s / steps);
+        if (p < 0 || p > 1) continue;
+        const cx = laneCenterX(tr.lane, p, g);
+        const y = projY(p, g);
+        const lw = laneWidth(p, g) * 0.85;
+        const grad = ctx.createLinearGradient(cx - lw / 2, y, cx + lw / 2, y);
+        grad.addColorStop(0, "rgba(255,255,255,0)");
+        grad.addColorStop(0.5, tr.color);
+        grad.addColorStop(1, "rgba(255,255,255,0)");
+        ctx.fillStyle = grad;
+        ctx.globalAlpha = a * 0.45;
+        ctx.fillRect(cx - lw / 2, y - 4, lw, 8);
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function drawNotes() {
+    const g = geometry();
+    // Sort by p so far notes draw first (behind)
+    notes.sort((a, b) => a.p - b.p);
+    ctx.save();
+    for (const n of notes) {
+      const p = n.p;
+      const cx = laneCenterX(n.lane, p, g);
+      const y = projY(p, g);
+      const lw = laneWidth(p, g) * 0.78;
+      const lh = lw * 0.55;
+      const color = LANE_COLORS[n.lane];
+
+      // Hold tail
+      if (n.hold) {
+        const tailEndP = Math.min(1, p + n.holdLen);
+        // draw a stretched stripe behind the note from p back to tailEndP-... actually tail extends "behind" upward toward vanishing
+        const tailFromP = Math.max(0, p - n.holdLen);
+        const steps = 10;
+        for (let s = 0; s < steps; s++) {
+          const tp = tailFromP + (p - tailFromP) * (s / steps);
+          if (tp < 0) continue;
+          const tcx = laneCenterX(n.lane, tp, g);
+          const ty = projY(tp, g);
+          const tlw = laneWidth(tp, g) * 0.35;
+          ctx.globalAlpha = 0.4 * (s / steps);
+          ctx.fillStyle = color.hex;
+          ctx.shadowBlur = 14;
+          ctx.shadowColor = color.glow;
+          ctx.fillRect(tcx - tlw / 2, ty - 3, tlw, 6);
+        }
+        ctx.shadowBlur = 0;
+        ctx.globalAlpha = 1;
+      }
+
+      // Outer bloom
+      ctx.shadowBlur = 22 * projScale(p);
+      ctx.shadowColor = color.glow;
+
+      // Note rounded rect
+      drawRoundedRect(cx - lw / 2, y - lh / 2, lw, lh, Math.min(lw, lh) * 0.35, color.hex);
+
+      // Specular shine
+      ctx.shadowBlur = 0;
+      const shineGrad = ctx.createLinearGradient(cx, y - lh / 2, cx, y + lh / 2);
+      shineGrad.addColorStop(0, "rgba(255,255,255,0.85)");
+      shineGrad.addColorStop(0.4, "rgba(255,255,255,0.15)");
+      shineGrad.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = shineGrad;
+      drawRoundedRectPath(cx - lw / 2 + 3, y - lh / 2 + 2, lw - 6, lh * 0.5, 6);
+      ctx.fill();
+
+      // Inner white core
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.beginPath();
+      ctx.ellipse(cx, y, lw * 0.18, lh * 0.18, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawRoundedRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+  function drawRoundedRect(x, y, w, h, r, fill) {
+    drawRoundedRectPath(x, y, w, h, r);
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+
+  function drawFretButtons(t) {
+    const g = geometry();
+    const y = g.strumY;
+
+    // Strum line
+    const pulse = 0.65 + 0.35 * Math.sin(t * 5);
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.shadowBlur = 22;
+    ctx.shadowColor = "#ffffff";
+    ctx.strokeStyle = `rgba(255,255,255,${0.7 * pulse})`;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(g.cx - g.bottomHalfWidth, y);
+    ctx.lineTo(g.cx + g.bottomHalfWidth, y);
+    ctx.stroke();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = `rgba(255,255,255,${0.95 * pulse})`;
+    ctx.shadowBlur = 4;
+    ctx.beginPath();
+    ctx.moveTo(g.cx - g.bottomHalfWidth, y);
+    ctx.lineTo(g.cx + g.bottomHalfWidth, y);
+    ctx.stroke();
+    ctx.restore();
+
+    // Fret buttons
+    for (let i = 0; i < LANES; i++) {
+      const cx = laneCenterX(i, 1, g);
+      const lw = laneWidth(1, g);
+      const r = lw * 0.32;
+
+      const flash = flashes.find(f => f.lane === i);
+      const flashAmt = flash ? Math.max(0, 1 - flash.age / flash.life) : 0;
+
+      // Outer pulse ring during flash
+      if (flashAmt > 0) {
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
+        ctx.strokeStyle = LANE_COLORS[i].glow;
+        ctx.lineWidth = 3;
+        ctx.globalAlpha = flashAmt;
+        ctx.beginPath();
+        ctx.arc(cx, y, r + 8 + (1 - flashAmt) * 24, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Base button
+      ctx.save();
+      ctx.shadowBlur = 18 + flashAmt * 30;
+      ctx.shadowColor = LANE_COLORS[i].glow;
+      const grad = ctx.createRadialGradient(cx, y - r * 0.4, r * 0.1, cx, y, r);
+      grad.addColorStop(0, "rgba(255,255,255,0.95)");
+      grad.addColorStop(0.4, LANE_COLORS[i].hex);
+      grad.addColorStop(1, "rgba(0,0,0,0.4)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(cx, y, r, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Rim
+      ctx.shadowBlur = 0;
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(255,255,255,0.6)";
+      ctx.beginPath();
+      ctx.arc(cx, y, r, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Inner highlight
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.beginPath();
+      ctx.ellipse(cx, y - r * 0.45, r * 0.55, r * 0.22, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawEffects() {
+    // Shockwaves
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (const s of shockwaves) {
+      const a = Math.max(0, 1 - s.age / s.life);
+      ctx.strokeStyle = s.color;
+      ctx.globalAlpha = a * 0.85;
+      ctx.lineWidth = 3 + (1 - a) * 4;
+      ctx.shadowBlur = 22;
+      ctx.shadowColor = s.color;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // Particles
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (const p of particles) {
+      const a = Math.max(0, 1 - p.age / p.life);
+      ctx.fillStyle = p.color;
+      ctx.shadowBlur = 12;
+      ctx.shadowColor = p.glow || p.color;
+      ctx.globalAlpha = a;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // Shards
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (const s of shards) {
+      const a = Math.max(0, 1 - s.age / s.life);
+      ctx.save();
+      ctx.translate(s.x, s.y);
+      ctx.rotate(s.rot);
+      ctx.fillStyle = s.color;
+      ctx.globalAlpha = a;
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = s.color;
+      ctx.fillRect(-s.len / 2, -s.thick / 2, s.len, s.thick);
+      ctx.restore();
+    }
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  // ----- HUD -----
+  function drawHUD(t) {
+    ctx.save();
+
+    // Score (top right)
+    const sx = W - 30;
+    const sy = 50;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "alphabetic";
+
+    // "SCORE" label
+    ctx.font = "bold 14px Impact, 'Arial Black', sans-serif";
+    ctx.fillStyle = "rgba(200,200,220,0.7)";
+    ctx.fillText("SCORE", sx, sy - 30);
+
+    // Big score
+    ctx.font = "bold 44px Impact, 'Arial Black', sans-serif";
+    ctx.shadowBlur = 14;
+    ctx.shadowColor = starPowerActive ? "#ffd24d" : "#88ccff";
+    ctx.fillStyle = starPowerActive ? "#ffe680" : "#ffffff";
+    const scoreStr = String(Math.floor(displayedScore)).padStart(6, "0");
+    ctx.fillText(scoreStr, sx, sy + 8);
+
+    // Multiplier
+    ctx.shadowBlur = 8;
+    ctx.font = "bold 28px Impact, 'Arial Black', sans-serif";
+    ctx.fillStyle = multiplier >= 4 ? "#ffd24d" : "#ffffff";
+    ctx.shadowColor = multiplier >= 4 ? "#ffd24d" : "#88ccff";
+    ctx.fillText("x" + multiplier, sx, sy + 44);
+
+    // Combo
+    ctx.shadowBlur = 0;
+    ctx.font = "bold 14px Impact, 'Arial Black', sans-serif";
+    ctx.fillStyle = "rgba(200,200,220,0.85)";
+    ctx.fillText(combo + " COMBO", sx, sy + 64);
+
+    // Star Power meter (top left)
+    const mx = 30, my = 30, mw = 220, mh = 18;
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(mx, my, mw, mh);
+    ctx.strokeStyle = "rgba(255,255,255,0.5)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(mx, my, mw, mh);
+
+    const fillW = (starPowerActive ? 1 : starPower) * mw;
+    const sg = ctx.createLinearGradient(mx, my, mx + mw, my);
+    if (starPowerActive) {
+      sg.addColorStop(0, "#fff8c4");
+      sg.addColorStop(0.5, "#ffd24d");
+      sg.addColorStop(1, "#ff9500");
+    } else {
+      sg.addColorStop(0, "#5fc8ff");
+      sg.addColorStop(0.6, "#a78bff");
+      sg.addColorStop(1, "#ff66cc");
+    }
+    ctx.fillStyle = sg;
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = starPowerActive ? "#ffd24d" : "#a78bff";
+    ctx.fillRect(mx + 1, my + 1, Math.max(0, fillW - 2), mh - 2);
+
+    // Star icon
+    ctx.shadowBlur = 0;
+    ctx.font = "bold 16px Impact, 'Arial Black', sans-serif";
+    ctx.fillStyle = starPowerActive ? "#ffe680" : "rgba(220,220,255,0.95)";
+    ctx.textAlign = "left";
+    ctx.fillText("★ STAR POWER", mx, my - 8);
+
+    if (starPowerActive) {
+      const tt = starPowerTimer;
+      ctx.fillStyle = "#ffe680";
+      ctx.font = "bold 14px Impact, 'Arial Black', sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(tt.toFixed(1) + "s", mx + mw + 10, my + 14);
+    }
+
+    ctx.restore();
+  }
+
+  function drawGoldOverlay(t) {
+    if (!starPowerActive) return;
+    const pulse = 0.5 + 0.5 * Math.sin(t * 8);
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const g = ctx.createRadialGradient(W / 2, H * 0.7, 50, W / 2, H * 0.7, Math.max(W, H) * 0.8);
+    g.addColorStop(0, `rgba(255, 220, 120, ${0.18 * pulse})`);
+    g.addColorStop(1, "rgba(255,180,40,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  }
+
+  // ----- Main loop -----
+  let last = performance.now() / 1000;
+  let timeAccum = 0;
+
+  function frame(now) {
+    now = now / 1000;
+    let dt = Math.min(0.05, now - last);
+    last = now;
+    timeAccum += dt;
+
+    // Density: spawns in last 1.5s
+    const cutoff = performance.now() - 1500;
+    while (densityWindow.length && densityWindow[0] < cutoff) densityWindow.shift();
+    const density = Math.min(1, densityWindow.length / 12);
+
+    // Update spawning
+    updateSpawning(dt);
+
+    // Update notes
+    let chordHitThisFrame = false;
+    const hitFlashLanes = new Set();
+    for (let i = notes.length - 1; i >= 0; i--) {
+      const n = notes[i];
+      n.p += n.speed * dt;
+      if (!n.hit && n.p >= 1.0) {
+        n.hit = true;
+        spawnHitFX(n.lane, n.chord);
+        hitFlashLanes.add(n.lane);
+        if (n.chord) chordHitThisFrame = true;
+        if (n.hold) {
+          spawnHoldTrail(n.lane, Math.max(0, 1 - n.holdLen), 1);
+          onHit(false, 30);
+        } else {
+          onHit(n.chord);
+        }
+        notes.splice(i, 1);
+      } else if (n.p > 1.4) {
+        notes.splice(i, 1);
+      }
+    }
+
+    // If multi-hit at same frame, count chord-style bonus illumination
+    const multiHit = hitFlashLanes.size >= 2;
+
+    // Update effects
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.age += dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 320 * dt; // gravity downward
+      p.vx *= 0.985;
+      if (p.age >= p.life) particles.splice(i, 1);
+    }
+    for (let i = shards.length - 1; i >= 0; i--) {
+      const s = shards[i];
+      s.age += dt;
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+      s.vy += 280 * dt;
+      s.vx *= 0.985;
+      s.rot += s.vrot * dt;
+      if (s.age >= s.life) shards.splice(i, 1);
+    }
+    for (let i = shockwaves.length - 1; i >= 0; i--) {
+      const s = shockwaves[i];
+      s.age += dt;
+      const k = Math.min(1, s.age / s.life);
+      s.r = 10 + (s.maxR - 10) * (1 - Math.pow(1 - k, 3));
+      if (s.age >= s.life) shockwaves.splice(i, 1);
+    }
+    for (let i = flashes.length - 1; i >= 0; i--) {
+      flashes[i].age += dt;
+      if (flashes[i].age >= flashes[i].life) flashes.splice(i, 1);
+    }
+    for (let i = laneTrails.length - 1; i >= 0; i--) {
+      laneTrails[i].age += dt;
+      if (laneTrails[i].age >= laneTrails[i].life) laneTrails.splice(i, 1);
+    }
+
+    // Star power
+    if (starPowerActive) {
+      starPowerTimer -= dt;
+      if (starPowerTimer <= 0) {
+        starPowerActive = false;
+        starPower = 0;
+      }
+    }
+
+    // Animate displayed score (tick up)
+    displayedScore += (score - displayedScore) * Math.min(1, dt * 6);
+
+    // Convert any white particle to prismatic during star power
+    if (starPowerActive) {
+      for (const p of particles) {
+        // randomly recolor a fraction
+        if (Math.random() < 0.06) {
+          const h = Math.floor(Math.random() * 360);
+          p.color = `hsl(${h},100%,75%)`;
+        }
+      }
+    }
+
+    // ----- Render -----
+    ctx.clearRect(0, 0, W, H);
+    drawBackground(timeAccum);
+    drawSpotlights(timeAccum, density, chordHitThisFrame || multiHit);
+    drawHazeAndGodRays(timeAccum);
+    drawHighway(timeAccum);
+    drawLaneTrails();
+    drawNotes();
+    drawEffects();
+    drawFretButtons(timeAccum);
+    drawCrowd(timeAccum, density, chordHitThisFrame || multiHit || starPowerActive);
+    drawGoldOverlay(timeAccum);
+    drawHUD(timeAccum);
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
